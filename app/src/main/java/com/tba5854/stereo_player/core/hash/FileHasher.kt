@@ -1,4 +1,4 @@
-package com.tba5854.stereo_player.hasher
+package com.tba5854.stereo_player.core.hash
 
 import java.io.File
 import java.io.FileInputStream

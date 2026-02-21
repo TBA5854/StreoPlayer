@@ -3,7 +3,7 @@
   <component name="ProjectMigrations">
     <option name="MigrateToGradleLocalJavaHome">
       <set>
-        <option value="/media/tba/files/projects/AndroidStudioProjects/StreoPlayer" />
+        <option value="$PROJECT_DIR$" />
       </set>
     </option>
   </component>
