@@ -26,6 +26,8 @@ class ExoPlayerManager @Inject constructor(@ApplicationContext private val conte
 
     var onNextCallback: (() -> Unit)? = null
     var onPrevCallback: (() -> Unit)? = null
+    var onSeekCallback: ((Double) -> Unit)? = null
+    var onStateChangedCallback: ((Int) -> Unit)? = null
 
     private val forwardingPlayer =
             object : ForwardingPlayer(player) {
@@ -66,6 +68,21 @@ class ExoPlayerManager @Inject constructor(@ApplicationContext private val conte
                     }
                     override fun onPlaybackStateChanged(state: Int) {
                         _isPlayingFlow.value = player.isPlaying
+                        onStateChangedCallback?.invoke(state)
+                        if (state == Player.STATE_READY) {
+                            handleReadyState()
+                        }
+                    }
+                    override fun onPositionDiscontinuity(
+                            oldPosition: Player.PositionInfo,
+                            newPosition: Player.PositionInfo,
+                            reason: Int
+                    ) {
+                        if (reason == Player.DISCONTINUITY_REASON_SEEK ||
+                                        reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT
+                        ) {
+                            onSeekCallback?.invoke(newPosition.positionMs / 1000.0)
+                        }
                     }
                 }
         )
@@ -80,14 +97,15 @@ class ExoPlayerManager @Inject constructor(@ApplicationContext private val conte
         player.prepare()
     }
 
+    private var _onReadyCallback: (() -> Unit)? = null
+
     fun onReady(callback: () -> Unit) {
-        player.addListener(
-                object : Player.Listener {
-                    override fun onPlaybackStateChanged(state: Int) {
-                        if (state == Player.STATE_READY) callback()
-                    }
-                }
-        )
+        _onReadyCallback = callback
+    }
+
+    private fun handleReadyState() {
+        _onReadyCallback?.invoke()
+        _onReadyCallback = null
     }
 
     fun loadUri(uri: Uri, title: String? = null) {
@@ -133,6 +151,12 @@ class ExoPlayerManager @Inject constructor(@ApplicationContext private val conte
     }
 
     fun isPlaying(): Boolean = player.isPlaying
+
+    /**
+     * True if the player intends to play — stays true during BUFFERING after a seek, unlike
+     * isPlaying() which goes false briefly while buffering.
+     */
+    fun isPlayWhenReady(): Boolean = player.playWhenReady
 
     fun getCurrentPositionMs(): Long = player.currentPosition
 

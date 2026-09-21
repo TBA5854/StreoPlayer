@@ -103,7 +103,7 @@ fun EntryScreen(
             Spacer(Modifier.height(24.dp))
 
             Text(
-                    "Stereo Player",
+                    "SyncBeats",
                     style =
                             MaterialTheme.typography.displayLarge.copy(
                                     fontWeight = FontWeight.Bold

@@ -90,11 +90,26 @@ object SyncApi {
         }
 
         val body = response.body() ?: throw RuntimeException("Empty response body")
-        val dest = File(destDir, fileId)
+
+        var fileName = fileId
+        val cd = response.headers()["Content-Disposition"]
+        if (cd != null) {
+            val match = Regex("filename=\"([^\"]+)\"").find(cd)
+            if (match != null) {
+                fileName = match.groupValues[1]
+            } else {
+                val matchUnquoted = Regex("filename=([^;]+)").find(cd)
+                if (matchUnquoted != null) {
+                    fileName = matchUnquoted.groupValues[1].trim()
+                }
+            }
+        }
+
+        val dest = File(destDir, fileName)
 
         FileOutputStream(dest).use { out -> body.byteStream().use { it.copyTo(out) } }
 
-        Log.d(TAG, "Downloaded $fileId → ${dest.absolutePath}")
+        Log.d(TAG, "Downloaded $fileId (name=$fileName) → ${dest.absolutePath}")
         return dest
     }
 }

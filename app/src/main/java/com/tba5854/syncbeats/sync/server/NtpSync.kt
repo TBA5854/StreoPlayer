@@ -17,7 +17,7 @@ object NtpSync {
         offset = samples.sorted()[samples.size / 2]
     }
 
-    fun adjustedTime(serverTimestamp: Long): Long = serverTimestamp + offset
+    fun adjustedTime(serverTimestamp: Long): Long = serverTimestamp - offset
 
     fun reset() {
         samples.clear()

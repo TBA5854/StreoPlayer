@@ -3,10 +3,27 @@ package com.tba5854.syncbeats.sync.server
 import com.google.gson.annotations.SerializedName
 import org.json.JSONObject
 
+data class User(
+        @SerializedName("user_id") val userId: String,
+        @SerializedName("username") val username: String,
+        @SerializedName("is_ready") val isReady: Boolean = false
+) {
+        companion object {
+                fun fromJson(json: JSONObject): User {
+                        return User(
+                                userId = json.optString("user_id", ""),
+                                username = json.optString("username", ""),
+                                isReady = json.optBoolean("is_ready", false)
+                        )
+                }
+        }
+}
+
 data class RoomState(
         @SerializedName("room_id") val roomId: String,
         @SerializedName("name") val name: String,
         @SerializedName("owner_id") val ownerId: String,
+        @SerializedName("users") val users: List<User> = emptyList(),
         @SerializedName("track_hash") val trackHash: String,
         @SerializedName("is_playing") val isPlaying: Boolean,
         @SerializedName("position") val position: Double,
@@ -21,10 +38,20 @@ data class RoomState(
                                 if (queueArray != null) {
                                         List(queueArray.length()) { i -> queueArray.getString(i) }
                                 } else emptyList()
+
+                        val usersArray = json.optJSONArray("users")
+                        val users =
+                                if (usersArray != null) {
+                                        List(usersArray.length()) { i ->
+                                                User.fromJson(usersArray.getJSONObject(i))
+                                        }
+                                } else emptyList()
+
                         return RoomState(
                                 roomId = json.optString("room_id", ""),
                                 name = json.optString("name", ""),
                                 ownerId = json.optString("owner_id", ""),
+                                users = users,
                                 trackHash = json.optString("track_hash", ""),
                                 isPlaying = json.optBoolean("is_playing", false),
                                 position = json.optDouble("position", 0.0),

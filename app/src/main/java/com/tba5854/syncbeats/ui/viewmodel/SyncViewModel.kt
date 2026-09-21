@@ -93,13 +93,11 @@ constructor(
     private val activeUploads = mutableSetOf<String>()
     private val activeDownloads = mutableSetOf<String>()
 
-
     private val _currentSoloTrack = MutableStateFlow<String?>(null)
     val currentSoloTrack: StateFlow<String?> = _currentSoloTrack
 
     private val _durationMs = MutableStateFlow(0L)
     val durationMs: StateFlow<Long> = _durationMs
-
 
     val navStack: androidx.compose.runtime.snapshots.SnapshotStateList<String> = run {
         val saved: ArrayList<String>? = savedState["navStack"]
@@ -146,15 +144,13 @@ constructor(
         }
     }
 
-
     private var socket: SyncSocket? = null
     private var currentRoomId: String? = null
 
     init {
-        playerManager.onNextCallback = {
-            if (_roomState.value != null) queueNext()
-        }
+        playerManager.onNextCallback = { if (_roomState.value != null) queueNext() }
         playerManager.onPrevCallback = { if (_roomState.value != null) queuePrev() }
+        playerManager.onSeekCallback = { broadcastCurrentStateIfHost() }
 
         viewModelScope.launch {
             while (true) {
@@ -162,8 +158,70 @@ constructor(
                 _playbackPos.value = playerManager.getCurrentPositionSec()
             }
         }
+
+        viewModelScope.launch {
+            while (true) {
+                if (_connectionState.value is ConnectionState.Connected) {
+                    socket?.sendNtp()
+                }
+                delay(5500)
+            }
+        }
     }
 
+    private fun broadcastCurrentStateIfHost() {
+        val room = _roomState.value ?: return
+        if (room.ownerId != Settings.config.userId) return
+        if (isApplyingRemoteEvent) return
+        val pos = playerManager.getCurrentPositionSec()
+        // Use playWhenReady rather than isPlaying() — the latter goes false during buffering
+        // (e.g. mid-seek), which would incorrectly broadcast sync:pause while the host is still
+        // intending to play.
+        if (playerManager.isPlayWhenReady()) {
+            val localStartMs = System.currentTimeMillis() + 250L
+            val startAt = localStartMs + NtpSync.offset - (pos * 1000).toLong()
+            socket?.play(room.roomId, pos, startAt)
+
+            // Re-schedule the playback to mathematically mirror the clients' delay so the host
+            // starts perfectly synced instead of 250ms ahead.
+            playerManager.pause()
+            playerManager.playAtTime(localStartMs)
+        } else {
+            socket?.pause(room.roomId, pos)
+        }
+    }
+
+    private fun syncStateFromRoom(state: RoomState) {
+        if (state.ownerId == Settings.config.userId) return
+        if (state.isPlaying) {
+            val adjustedStart = NtpSync.adjustedTime(state.startAt)
+            val elapsedMs = System.currentTimeMillis() - adjustedStart
+            val basePosMs = (state.position * 1000).toLong()
+            val expectedPosMs = basePosMs + elapsedMs
+            val currentPosMs = playerManager.getCurrentPositionMs()
+            val driftMs = Math.abs(expectedPosMs - currentPosMs)
+
+            if (elapsedMs > 0) {
+                // The play event timestamp has already passed.
+                // Seek only if the drift is noticeable (>50ms) to avoid buffering stutters on
+                // micro-adjustments.
+                if (driftMs > 50L) {
+                    playerManager.seekTo(expectedPosMs)
+                }
+                playerManager.play()
+            } else {
+                // The play event timestamp is in the future.
+                // Seek to the base position and wait for the timestamp to invoke play().
+                if (Math.abs(basePosMs - currentPosMs) > 50L) {
+                    playerManager.seekTo(basePosMs)
+                }
+                playerManager.playAtTime(adjustedStart)
+            }
+        } else {
+            playerManager.pause()
+            playerManager.seekToSec(state.position)
+        }
+    }
 
     fun connect(serverIp: String = savedServerIp) {
         if (_connectionState.value !is ConnectionState.Disconnected) return
@@ -191,7 +249,6 @@ constructor(
         _currentSoloTrack.value = null
     }
 
-
     fun createRoom(name: String) {
         socket?.createRoom(name)
     }
@@ -211,14 +268,19 @@ constructor(
         }
     }
 
-
     fun setTrack(hash: String) {
         currentRoomId?.let { socket?.setTrack(it, hash) }
     }
 
     fun play() {
-        playerManager.play()
-        currentRoomId?.let { socket?.play(it, playerManager.getCurrentPositionSec()) }
+        currentRoomId?.let { roomId ->
+            val pos = playerManager.getCurrentPositionSec()
+            val localStartMs = System.currentTimeMillis() + 250L
+            val startAt = localStartMs + NtpSync.offset - (pos * 1000).toLong()
+            socket?.play(roomId, pos, startAt)
+            playerManager.playAtTime(localStartMs)
+        }
+                ?: run { playerManager.play() }
     }
 
     fun pause() {
@@ -229,9 +291,20 @@ constructor(
     fun seek(pos: Double) {
         _playbackPos.value = pos
         playerManager.seekToSec(pos)
-        currentRoomId?.let { socket?.seek(it, pos) }
+        currentRoomId?.let { roomId ->
+            // When playing, schedule 250ms ahead and include start_at so receivers can
+            // NTP-adjust playback position.
+            val startAt =
+                    if (playerManager.isPlaying()) {
+                        val localStartMs = System.currentTimeMillis() + 250L
+                        playerManager.pause()
+                        playerManager.playAtTime(localStartMs)
+                        localStartMs + NtpSync.offset - (pos * 1000).toLong()
+                    } else 0L
+            socket?.seek(roomId, pos, startAt)
+        }
+        broadcastCurrentStateIfHost()
     }
-
 
     fun queueAdd(hash: String) {
         currentRoomId?.let { socket?.queueAdd(it, hash) }
@@ -257,7 +330,6 @@ constructor(
         currentRoomId?.let { socket?.queuePlayAt(it, index) }
     }
 
-
     fun updateServerIp(ip: String) {
         savedServerIp = ip
         Settings.update { it.serverIp = ip }
@@ -267,7 +339,6 @@ constructor(
     fun resync() {
         currentRoomId?.let { socket?.requestState(it) }
     }
-
 
     fun playSolo(hash: String) {
         _currentSoloTrack.value = hash
@@ -295,9 +366,19 @@ constructor(
 
     fun soloIsPlaying(): Boolean = playerManager.isPlaying()
 
-
     override fun onConnected() {
         _connectionState.value = ConnectionState.Connected()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val remoteFiles = SyncApi.listFiles()
+                withContext(Dispatchers.Main) {
+                    val newNames = remoteFiles.associate { it.fileId to it.fileName }
+                    _resolvedNames.value = _resolvedNames.value + newNames
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
     }
 
     override fun onDisconnected(reason: String?) {
@@ -318,7 +399,15 @@ constructor(
         currentRoomId = state.roomId
         savedRoomId = state.roomId
         val cfg = Settings.config
-        _members.value = mapOf(cfg.userId to cfg.userName)
+
+        // Build the members map from the room state's user list
+        val joinedMembers = state.users.associate { it.userId to it.username }.toMutableMap()
+        // Ensure the current user is always included
+        joinedMembers[cfg.userId] = cfg.userName
+        _members.value = joinedMembers
+
+        state.queue.forEach { resolveHash(it) }
+        loadTrackAndSync(state, showChangedBy = false)
     }
 
     override fun onRoomLeft(roomId: String) {
@@ -338,17 +427,33 @@ constructor(
 
     override fun onRoomState(state: RoomState) {
         _roomState.value = state
+        val cfg = Settings.config
+        val stateMembers = state.users.associate { it.userId to it.username }.toMutableMap()
+        stateMembers[cfg.userId] = cfg.userName
+        _members.value = stateMembers
+
         resolveHash(state.trackHash)
         state.queue.forEach { resolveHash(it) }
+        syncStateFromRoom(state)
     }
 
     override fun onTrackChanged(state: RoomState) {
         _roomState.value = state
         resolveHash(state.trackHash)
-        _trackChangedBy.value = state.ownerId
-        viewModelScope.launch {
-            delay(3000)
-            _trackChangedBy.value = null
+        loadTrackAndSync(state, showChangedBy = true)
+    }
+
+    /**
+     * Loads the track from [state] (downloading if necessary) and, once ready, applies the room's
+     * playback state. Used on both track-change and room-join events.
+     */
+    private fun loadTrackAndSync(state: RoomState, showChangedBy: Boolean) {
+        if (showChangedBy) {
+            _trackChangedBy.value = state.ownerId
+            viewModelScope.launch {
+                delay(3000)
+                _trackChangedBy.value = null
+            }
         }
         viewModelScope.launch(Dispatchers.IO) {
             val hash = state.trackHash
@@ -361,6 +466,11 @@ constructor(
                     playerManager.loadFile(localFile, title)
                     playerManager.onReady {
                         _durationMs.value = playerManager.getDurationMs() ?: 0L
+                        if (state.ownerId == Settings.config.userId) {
+                            broadcastCurrentStateIfHost()
+                        } else {
+                            syncStateFromRoom(state)
+                        }
                     }
                 }
             } else {
@@ -372,17 +482,21 @@ constructor(
                                     SyncStatus.Downloading(_resolvedNames.value[hash] ?: hash)
                         }
                         val downloaded = SyncApi.downloadFile(hash, context.cacheDir)
-                        val importResult =
-                                MusicStorage.importFile(
-                                        downloaded,
-                                        _resolvedNames.value[hash] ?: hash
-                                )
-
+                        val importResult = MusicStorage.importFile(downloaded, downloaded.name)
                         withContext(Dispatchers.Main) {
-                            val title = _resolvedNames.value[hash]
-                            playerManager.loadFile(importResult.file, title)
+                            // Cache the true filename so the UI updates to show it instead of the
+                            // hash
+                            val realTitle = downloaded.name
+                            _resolvedNames.value = _resolvedNames.value + (hash to realTitle)
+
+                            playerManager.loadFile(importResult.file, realTitle)
                             playerManager.onReady {
                                 _durationMs.value = playerManager.getDurationMs() ?: 0L
+                                if (state.ownerId == Settings.config.userId) {
+                                    broadcastCurrentStateIfHost()
+                                } else {
+                                    syncStateFromRoom(state)
+                                }
                             }
                             if (_syncStatus.value is SyncStatus.Downloading) {
                                 _syncStatus.value = SyncStatus.Synced
@@ -403,20 +517,76 @@ constructor(
         event.queue.forEach { resolveHash(it) }
     }
 
+    private var lastSeekBroadcastTime = 0L
+    /**
+     * True while we are applying a remote socket event locally. Prevents seek callbacks from
+     * re-broadcasting the same event back to the server, which would create an infinite loop.
+     */
+    private var isApplyingRemoteEvent = false
+
     override fun onPlay(event: PlayEvent) {
-        _syncStatus.value = SyncStatus.Adjusting
-        val adjustedStart = NtpSync.adjustedTime(event.startAt)
-        playerManager.playAtTime(adjustedStart)
-        _syncStatus.value = SyncStatus.Synced
+        viewModelScope.launch(Dispatchers.Main) {
+            _syncStatus.value = SyncStatus.Adjusting
+            lastSeekBroadcastTime = System.currentTimeMillis()
+            isApplyingRemoteEvent = true
+            try {
+                val adjustedStart = NtpSync.adjustedTime(event.startAt)
+                val elapsedMs = System.currentTimeMillis() - adjustedStart
+                val basePosMs = (event.position * 1000).toLong()
+                val expectedPosMs = basePosMs + elapsedMs
+                val currentPosMs = playerManager.getCurrentPositionMs()
+                val driftMs = Math.abs(expectedPosMs - currentPosMs)
+
+                if (elapsedMs > 0) {
+                    if (driftMs > 50L) {
+                        playerManager.seekTo(expectedPosMs)
+                    }
+                    playerManager.play()
+                } else {
+                    if (Math.abs(basePosMs - currentPosMs) > 50L) {
+                        playerManager.seekTo(basePosMs)
+                    }
+                    playerManager.playAtTime(adjustedStart)
+                }
+            } finally {
+                isApplyingRemoteEvent = false
+            }
+            _syncStatus.value = SyncStatus.Synced
+        }
     }
 
     override fun onPause(event: PauseEvent) {
-        playerManager.pause()
-        playerManager.seekTo((event.position * 1000).toLong())
+        viewModelScope.launch(Dispatchers.Main) {
+            lastSeekBroadcastTime = System.currentTimeMillis()
+            isApplyingRemoteEvent = true
+            try {
+                playerManager.pause()
+                playerManager.seekTo((event.position * 1000).toLong())
+            } finally {
+                isApplyingRemoteEvent = false
+            }
+        }
     }
 
     override fun onSeek(event: SeekEvent) {
-        playerManager.seekToSec(event.position)
+        viewModelScope.launch(Dispatchers.Main) {
+            lastSeekBroadcastTime = System.currentTimeMillis()
+            isApplyingRemoteEvent = true
+            try {
+                if (event.startAt > 0) {
+                    // Host was playing — seek to position then let NTP-adjusted clock take over,
+                    // exactly like onPlay does, so network latency is compensated.
+                    playerManager.seekToSec(event.position)
+                    val adjustedStart = NtpSync.adjustedTime(event.startAt)
+                    playerManager.playAtTime(adjustedStart)
+                } else {
+                    // Host was paused — simple seek, no timing compensation needed.
+                    playerManager.seekToSec(event.position)
+                }
+            } finally {
+                isApplyingRemoteEvent = false
+            }
+        }
     }
 
     override fun onNtpPong(pong: NtpPong) {}
